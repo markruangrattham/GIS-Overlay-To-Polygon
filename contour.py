@@ -251,7 +251,10 @@ def findMaskBounds(rgb_color, theta=10):
     hsvColor = cv2.cvtColor(rgb_color, cv2.COLOR_BGR2HSV)
     # Saturation/value floors at 50 to accept darker or less-saturated shades of the color.
     # Previously these were 100, which was too strict and missed valid pixels.
-    lowerbound = np.array([hsvColor[0][0][0] - theta, 50, 50])  # look at hsv cone/cyl
+    # Semi-transparent overlays blend with the underlying map, producing pixels
+    # with reduced saturation and value. Lower floors from 50 to 20 so these
+    # blended pixels are included in the mask.
+    lowerbound = np.array([hsvColor[0][0][0] - theta, 20, 20])  # look at hsv cone/cyl
     upperbound = np.array([hsvColor[0][0][0] + theta, 255, 255])
     return lowerbound, upperbound
     
@@ -297,18 +300,21 @@ def main():
     
     
     # Blur the HSV image to smooth out fine map details (roads, text, boundaries)
-    # that show through semi-transparent overlays. Without this, those details
-    # create holes in the mask because their pixels don't match the target color.
-    blurred_hsv = cv2.GaussianBlur(hsv, (15, 15), 0)
+    # that show through semi-transparent overlays. 31x31 is larger than the
+    # typical road/text feature so those details average into the surrounding color.
+    blurred_hsv = cv2.GaussianBlur(hsv, (31, 31), 0)
 
     # Threshold the blurred HSV image to get pixels matching the target color
     mask = cv2.inRange(blurred_hsv, lowerbound, upperbound)
 
-    # Morphological closing (dilate then erode) fills small gaps left by map
-    # features bleeding through the semi-transparent overlay. The kernel size
-    # controls how large a gap can be bridged — 25x25 works for typical map detail.
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    # Two-pass morphological closing bridges gaps at two different scales:
+    #   Pass 1 (25x25) — fills small holes left by roads and thin text.
+    #   Pass 2 (75x75) — merges nearby disconnected blobs (e.g. where a large
+    #                     road or label cuts cleanly through the overlay region).
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_small)
+    kernel_large = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (75, 75))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_large)
 
     # Find contours in the cleaned-up mask
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
