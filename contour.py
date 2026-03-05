@@ -15,6 +15,11 @@
 
 
 import cv2 # handles the coloring and image processing
+try:
+    import lxml  # noqa: F401 — required by BeautifulSoup's 'xml' parser
+except ImportError:
+    print("Missing dependency: install lxml with  pip install lxml", file=sys.stderr)
+    raise
 from bs4 import BeautifulSoup # Note to self, way better than ElementTree
 # For the color select
 import numpy as np
