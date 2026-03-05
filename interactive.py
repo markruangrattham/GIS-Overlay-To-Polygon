@@ -266,6 +266,15 @@ def main():
                 continue
 
             write_multi_kml(output_kml, name, polygons)
+
+            # Save a PNG showing all selected regions filled white on black,
+            # matching the mask output style from contour.py.
+            output_png = output_kml.rsplit('.', 1)[0] + ".png"
+            mask_image = np.zeros_like(image)
+            for sel in selections:
+                mask_image[sel['mask'] > 0] = (255, 255, 255)
+            cv2.imwrite(output_png, mask_image)
+            print("Saved mask image to {}".format(output_png))
             break
 
         elif key in (ord('+'), ord('=')):
