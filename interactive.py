@@ -2,34 +2,57 @@
 # Interactive color-picker mode for GIS-Overlay-To-Polygon.
 # Usage: python interactive.py <overlay.kml>
 #
-# Click on any colored region in the displayed image to sample its color.
-# The matching mask is shown as a green overlay in real time.
-# Press +/- to widen or narrow the hue tolerance.
-# Press Enter to confirm and write the KML polygon.
-# Press ESC to cancel.
+# Left-click any colored region to add it to your selection.
+# Each region gets its own highlight color so you can tell them apart.
+# Press +/- to adjust the hue tolerance of the LAST selected region.
+# Press z to undo the last selection, c to clear all.
+# Press Enter to save all selections as separate placemarks in one KML.
+# Press ESC to cancel without saving.
 
 import cv2
 import numpy as np
 import sys
 import os
 
-# Reuse the shared utilities from contour.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from contour import extractDataFromKML, transform_coordinates, writeKML, findMaskBounds
+from contour import extractDataFromKML, transform_coordinates, findMaskBounds
+from bs4 import BeautifulSoup
 
 # ── tunable defaults ─────────────────────────────────────────────────────────
-THETA_DEFAULT = 15   # hue tolerance, adjustable at runtime with +/-
-THETA_STEP    = 5    # how much each +/- keypress changes THETA
+THETA_DEFAULT = 15
+THETA_STEP    = 5
 THETA_MIN     = 5
 THETA_MAX     = 60
-DELTA         = 0.02  # polygon simplification (fraction of perimeter)
-AREAS         = 1     # how many disjoint regions to extract
-OPACITY       = 200   # KML polygon opacity (0-255)
-NEIGHBORHOOD  = 10    # px radius around click used for median color sampling
+DELTA         = 0.02   # polygon simplification (fraction of perimeter)
+AREAS         = 1      # largest N contours kept per selection
+OPACITY       = 200    # KML polygon opacity (0-255)
+NEIGHBORHOOD  = 10     # px radius for median color sampling
 # ─────────────────────────────────────────────────────────────────────────────
 
-WINDOW = "Click a region | +/- = tolerance | Enter = save KML | ESC = quit"
+WINDOW = "Left-click=add  +/-=tolerance  z=undo  c=clear  Enter=save  ESC=quit"
 
+# Distinct BGR tints cycled across selections so they're visually separable
+TINT_COLORS = [
+    (0,  220,  0),    # green
+    (0,  140, 255),   # orange
+    (220,  0, 220),   # magenta
+    (0,  220, 220),   # yellow
+    (255,  80,  0),   # blue
+    (0,   80, 200),   # red-orange
+    (200, 200,  0),   # teal
+]
+
+GOOGLE_KML_MULTI_TEMPLATE = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<kml xmlns="http://www.opengis.net/kml/2.2">'
+    '<Document>'
+    '<name></name>'
+    '</Document>'
+    '</kml>'
+)
+
+
+# ── image processing helpers ─────────────────────────────────────────────────
 
 def build_mask(blurred_hsv, bgr_pixel, theta):
     """Return a cleaned binary mask for bgr_pixel +/- theta hue."""
@@ -41,15 +64,6 @@ def build_mask(blurred_hsv, bgr_pixel, theta):
     k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (75, 75))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k2)
     return mask
-
-
-def overlay_mask(image, mask, color=(0, 220, 0), alpha=0.4):
-    """Return image with mask region tinted in color."""
-    preview = image.copy()
-    tint = np.zeros_like(preview)
-    tint[mask > 0] = color
-    cv2.addWeighted(tint, alpha, preview, 1.0 - alpha, 0, preview)
-    return preview
 
 
 def sample_color(image, x, y, radius=NEIGHBORHOOD):
@@ -67,9 +81,9 @@ def contours_from_mask(mask):
 
 
 def build_final_coords(contours, areas, hsv, center, bounds, rotation):
-    contour_areas = sorted([(cv2.contourArea(c), i) for i, c in enumerate(contours)],
-                           key=lambda x: x[0], reverse=True)
-    indices = [i for _, i in contour_areas[:areas]]
+    ranked = sorted([(cv2.contourArea(c), i) for i, c in enumerate(contours)],
+                    key=lambda x: x[0], reverse=True)
+    indices = [i for _, i in ranked[:areas]]
 
     close_pts = []
     final = None
@@ -86,24 +100,96 @@ def build_final_coords(contours, areas, hsv, center, bounds, rotation):
     return transform_coordinates(final, hsv, center, bounds, rotation)
 
 
-def status_bar(image, bgr, theta, picked):
-    """Draw a status line at the bottom of the image."""
-    out = image.copy()
-    h = out.shape[0]
-    if picked:
-        msg = ("THETA={:d}  |  sampled BGR=({:d},{:d},{:d})  |  +/- adjust  Enter=save  ESC=quit"
-               .format(theta, int(bgr[0]), int(bgr[1]), int(bgr[2])))
-        swatch = tuple(int(v) for v in bgr)
-    else:
-        msg = "Click on a colored region to start  |  ESC=quit"
-        swatch = None
-    cv2.rectangle(out, (0, h - 26), (out.shape[1], h), (30, 30, 30), -1)
-    cv2.putText(out, msg, (8, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1,
-                cv2.LINE_AA)
-    if swatch:
-        cv2.rectangle(out, (out.shape[1] - 36, h - 22), (out.shape[1] - 6, h - 4), swatch, -1)
-    return out
+# ── KML writer for multiple polygons ─────────────────────────────────────────
 
+def write_multi_kml(filename, doc_name, polygons):
+    """
+    Write a KML file with one <Placemark> per polygon.
+
+    polygons: list of dicts with keys:
+        'name'   – placemark label
+        'coords' – array of (lon, lat) pairs
+        'bgr'    – np.uint8 [[[B, G, R]]] color array
+    """
+    soup = BeautifulSoup(GOOGLE_KML_MULTI_TEMPLATE, 'xml')
+    soup.find('name').string = doc_name
+
+    doc = soup.find('Document')
+    altitude = 0
+
+    for poly in polygons:
+        bgr = poly['bgr']
+        color_hex = "{:02x}{:02x}{:02x}{:02x}".format(
+            OPACITY, int(bgr[0][0][0]), int(bgr[0][0][1]), int(bgr[0][0][2]))
+
+        style_id = "style_{}".format(poly['name'].replace(' ', '_'))
+
+        style_tag = BeautifulSoup(
+            '<Style id="{sid}">'
+            '  <LineStyle><color>{c}</color></LineStyle>'
+            '  <PolyStyle><color>{c}</color></PolyStyle>'
+            '</Style>'.format(sid=style_id, c=color_hex), 'xml').find('Style')
+        doc.append(style_tag)
+
+        coord_str = '\n\t'.join(
+            ','.join(map(str, list(pair) + [altitude])) for pair in poly['coords'])
+
+        placemark_tag = BeautifulSoup(
+            '<Placemark>'
+            '  <name>{n}</name>'
+            '  <styleUrl>#{sid}</styleUrl>'
+            '  <Polygon>'
+            '    <tessellate>1</tessellate>'
+            '    <outerBoundaryIs>'
+            '      <LinearRing>'
+            '        <coordinates>{coords}</coordinates>'
+            '      </LinearRing>'
+            '    </outerBoundaryIs>'
+            '  </Polygon>'
+            '</Placemark>'.format(n=poly['name'], sid=style_id, coords=coord_str),
+            'xml').find('Placemark')
+        doc.append(placemark_tag)
+
+    print("Writing {} polygon(s) to {}".format(len(polygons), filename))
+    with open(filename, 'w') as f:
+        f.write(soup.prettify().replace('kml:', ''))
+
+
+# ── display helpers ───────────────────────────────────────────────────────────
+
+def render_frame(image, selections, current_theta):
+    """Composite all selection masks onto the image and draw status bar."""
+    preview = image.copy()
+
+    for idx, sel in enumerate(selections):
+        tint_color = TINT_COLORS[idx % len(TINT_COLORS)]
+        tint = np.zeros_like(preview)
+        tint[sel['mask'] > 0] = tint_color
+        cv2.addWeighted(tint, 0.4, preview, 0.6, 0, preview)
+
+    h, w = preview.shape[:2]
+    n = len(selections)
+    if n == 0:
+        msg = "Left-click a colored region to add it  |  ESC=quit"
+        swatch = None
+    else:
+        last = selections[-1]
+        b, g, rc = int(last['bgr'][0]), int(last['bgr'][1]), int(last['bgr'][2])
+        msg = ("{} region(s)  |  last BGR=({},{},{})  THETA={}  |  "
+               "+/-=adjust last  z=undo  c=clear  Enter=save  ESC=quit"
+               .format(n, b, g, rc, current_theta))
+        swatch = (b, g, rc)
+
+    cv2.rectangle(preview, (0, h - 26), (w, h), (30, 30, 30), -1)
+    cv2.putText(preview, msg, (8, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                (220, 220, 220), 1, cv2.LINE_AA)
+    if swatch:
+        cv2.rectangle(preview, (w - 36, h - 22), (w - 6, h - 4), swatch, -1)
+
+    return preview
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     if len(sys.argv) < 2:
@@ -112,9 +198,9 @@ def main():
 
     input_kml = sys.argv[1]
     base_path = os.path.dirname(input_kml) or '.'
-    name, image_name, n, s, e, w, r = extractDataFromKML(input_kml)
-    center = ((w + e) / 2, (n + s) / 2)
-    bounds = (e - w, n - s)
+    name, image_name, n_lat, s_lat, e_lon, w_lon, rotation = extractDataFromKML(input_kml)
+    center = ((w_lon + e_lon) / 2, (n_lat + s_lat) / 2)
+    bounds = (e_lon - w_lon, n_lat - s_lat)
     image_path = "{}/{}".format(base_path, image_name)
     output_kml = "poly-{}.kml".format(name)
 
@@ -123,35 +209,31 @@ def main():
         print("Could not load image: {}".format(image_path), file=sys.stderr)
         sys.exit(1)
 
-    # Pre-blur once; reused for every mask rebuild
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     blurred_hsv = cv2.GaussianBlur(hsv, (31, 31), 0)
 
-    state = dict(bgr=np.array([0, 0, 0]), theta=THETA_DEFAULT, mask=None, picked=False)
+    # selections: list of {bgr, theta, mask}
+    selections = []
+    current_theta = THETA_DEFAULT
 
     def redraw():
-        if state['picked']:
-            preview = overlay_mask(image, state['mask'])
-        else:
-            preview = image.copy()
-        frame = status_bar(preview, state['bgr'], state['theta'], state['picked'])
-        cv2.imshow(WINDOW, frame)
+        cv2.imshow(WINDOW, render_frame(image, selections, current_theta))
 
     def on_mouse(event, x, y, flags, _param):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
-        state['bgr'] = sample_color(image, x, y)
-        state['mask'] = build_mask(blurred_hsv, state['bgr'], state['theta'])
-        state['picked'] = True
-        b, g, r_ch = state['bgr']
-        print("Sampled BGR=({},{},{})  THETA={}  -- press Enter to save, +/- to adjust"
-              .format(int(b), int(g), int(r_ch), state['theta']))
+        bgr = sample_color(image, x, y)
+        mask = build_mask(blurred_hsv, bgr, current_theta)
+        selections.append({'bgr': bgr, 'theta': current_theta, 'mask': mask})
+        b, g, rc = int(bgr[0]), int(bgr[1]), int(bgr[2])
+        print("[{}] Added region  BGR=({},{},{})  THETA={}  |  z=undo  Enter=save"
+              .format(len(selections), b, g, rc, current_theta))
         redraw()
 
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     cv2.setMouseCallback(WINDOW, on_mouse)
     redraw()
-    print("Window open. Click a colored region. +/- to adjust tolerance. Enter=save. ESC=quit.")
+    print("Left-click regions to select them. +/- adjusts last. z=undo. c=clear. Enter=save. ESC=quit.")
 
     while True:
         key = cv2.waitKey(30) & 0xFF
@@ -160,33 +242,63 @@ def main():
             print("Cancelled.")
             break
 
-        elif key in (13, 10):  # Enter
-            if not state['picked']:
-                print("Click a region first.")
+        elif key in (13, 10):  # Enter — save all selections
+            if not selections:
+                print("No regions selected yet.")
                 continue
-            contours = contours_from_mask(state['mask'])
-            if not contours:
-                print("No contours found -- try clicking a different spot or pressing + to widen tolerance.")
+
+            polygons = []
+            for idx, sel in enumerate(selections):
+                contours = contours_from_mask(sel['mask'])
+                if not contours:
+                    print("Region {} has no contours, skipping.".format(idx + 1))
+                    continue
+                coords = build_final_coords(contours, AREAS, hsv, center, bounds, rotation)
+                bgr = sel['bgr']
+                polygons.append({
+                    'name': 'region-{}'.format(idx + 1),
+                    'coords': coords,
+                    'bgr': np.uint8([[[int(bgr[0]), int(bgr[1]), int(bgr[2])]]]),
+                })
+
+            if not polygons:
+                print("No valid polygons to save.")
                 continue
-            coords = build_final_coords(contours, AREAS, hsv, center, bounds, r)
-            bgr = state['bgr']
-            kml_color = np.uint8([[[int(bgr[0]), int(bgr[1]), int(bgr[2])]]])
-            writeKML(output_kml, coords, kml_color)
-            print("Saved polygon to {}".format(output_kml))
+
+            write_multi_kml(output_kml, name, polygons)
             break
 
-        elif key in (ord('+'), ord('=')):  # + or = (same key without shift)
-            state['theta'] = min(THETA_MAX, state['theta'] + THETA_STEP)
-            print("THETA -> {}".format(state['theta']))
-            if state['picked']:
-                state['mask'] = build_mask(blurred_hsv, state['bgr'], state['theta'])
+        elif key in (ord('+'), ord('=')):
+            current_theta = min(THETA_MAX, current_theta + THETA_STEP)
+            print("THETA -> {}".format(current_theta))
+            if selections:
+                sel = selections[-1]
+                sel['theta'] = current_theta
+                sel['mask'] = build_mask(blurred_hsv, sel['bgr'], current_theta)
             redraw()
 
         elif key == ord('-'):
-            state['theta'] = max(THETA_MIN, state['theta'] - THETA_STEP)
-            print("THETA -> {}".format(state['theta']))
-            if state['picked']:
-                state['mask'] = build_mask(blurred_hsv, state['bgr'], state['theta'])
+            current_theta = max(THETA_MIN, current_theta - THETA_STEP)
+            print("THETA -> {}".format(current_theta))
+            if selections:
+                sel = selections[-1]
+                sel['theta'] = current_theta
+                sel['mask'] = build_mask(blurred_hsv, sel['bgr'], current_theta)
+            redraw()
+
+        elif key == ord('z'):  # undo last selection
+            if selections:
+                removed = selections.pop()
+                b, g, rc = int(removed['bgr'][0]), int(removed['bgr'][1]), int(removed['bgr'][2])
+                print("Removed last region (BGR={},{},{}) — {} remaining"
+                      .format(b, g, rc, len(selections)))
+                redraw()
+            else:
+                print("Nothing to undo.")
+
+        elif key == ord('c'):  # clear all
+            selections.clear()
+            print("Cleared all selections.")
             redraw()
 
     cv2.destroyAllWindows()
