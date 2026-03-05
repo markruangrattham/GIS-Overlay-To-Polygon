@@ -296,10 +296,21 @@ def main():
     lowerbound, upperbound = findMaskBounds(RGBCOLOR, THETA);
     
     
-    # Threshold the HSV image to get only red colors
-    mask = cv2.inRange(hsv, lowerbound, upperbound)
-    
-    # Find contours in the mask
+    # Blur the HSV image to smooth out fine map details (roads, text, boundaries)
+    # that show through semi-transparent overlays. Without this, those details
+    # create holes in the mask because their pixels don't match the target color.
+    blurred_hsv = cv2.GaussianBlur(hsv, (15, 15), 0)
+
+    # Threshold the blurred HSV image to get pixels matching the target color
+    mask = cv2.inRange(blurred_hsv, lowerbound, upperbound)
+
+    # Morphological closing (dilate then erode) fills small gaps left by map
+    # features bleeding through the semi-transparent overlay. The kernel size
+    # controls how large a gap can be bridged — 25x25 works for typical map detail.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    # Find contours in the cleaned-up mask
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     # Simplify every contour in-place. DELTA controls how closely the polygon
