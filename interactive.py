@@ -267,12 +267,13 @@ def main():
 
             write_multi_kml(output_kml, name, polygons)
 
-            # Save a PNG showing all selected regions filled white on black,
-            # matching the mask output style from contour.py.
+            # Save a PNG with each region filled in its own distinct color
+            # (the same tint palette used in the live preview).
             output_png = output_kml.rsplit('.', 1)[0] + ".png"
             mask_image = np.zeros_like(image)
-            for sel in selections:
-                mask_image[sel['mask'] > 0] = (255, 255, 255)
+            for idx, sel in enumerate(selections):
+                color = TINT_COLORS[idx % len(TINT_COLORS)]
+                mask_image[sel['mask'] > 0] = color
             cv2.imwrite(output_png, mask_image)
             print("Saved mask image to {}".format(output_png))
             break
