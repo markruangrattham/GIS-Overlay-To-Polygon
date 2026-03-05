@@ -29,7 +29,7 @@ AREAS=1; # set of disjoint areas for a specific color
 RGBCOLOR = np.uint8([[[  0, 0, 200]]])  # bgr color to select (rgb order is backwards)
 OPACITY=200 # Default Opacity of our polygon (0-255), 200 is approx 78%
 THETA=15  # hsv, hue +/- angle THETA (Larger number accepts larger color range)
-DELTA=0.2 # idk fam, changed this value and it didn't really do anything
+DELTA=0.02 # Polygon simplification factor (fraction of contour perimeter). Lower = more detail.
 SAVE_IMAGE=False # save our mask as a .png?
 
 PREVIEW_MASK=False # Preview our overlay on top of old image to see if it looks right
@@ -244,8 +244,9 @@ def findMaskBounds(rgb_color, theta=10):
     @Returns a pair of hsv values, a lower and a upper bound value for hsvValue for later recognition.
     '''
     hsvColor = cv2.cvtColor(rgb_color, cv2.COLOR_BGR2HSV)
-    # FIXME: I believe this +/- 10 might need to overflow/wrap, idk how colors work
-    lowerbound = np.array([hsvColor[0][0][0] - theta, 100, 100]) #look at hsv cone/cyl
+    # Saturation/value floors at 50 to accept darker or less-saturated shades of the color.
+    # Previously these were 100, which was too strict and missed valid pixels.
+    lowerbound = np.array([hsvColor[0][0][0] - theta, 50, 50])  # look at hsv cone/cyl
     upperbound = np.array([hsvColor[0][0][0] + theta, 255, 255])
     return lowerbound, upperbound
     
@@ -296,11 +297,12 @@ def main():
     # Find contours in the mask
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    # Iterate through the contours
-    for contour in contours:
-        # Approximate the contour to reduce the number of points
-        epsilon = DELTA * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
+    # Simplify every contour in-place. DELTA controls how closely the polygon
+    # follows the original shape — smaller = more faithful, larger = smoother.
+    contours = [
+        cv2.approxPolyDP(c, DELTA * cv2.arcLength(c, True), True)
+        for c in contours
+    ]
     
     # Create a blank image to draw contours
     contour_image = np.zeros_like(image, np.uint8)
@@ -309,20 +311,14 @@ def main():
     #cv2.drawContours(contour_image, [contour], -1, (0, 255, 0), 2)  # You can adjust the color and thickness here
     
     
-    # Iterate through the contours
-    i = 0;
-    max_contour = 0;
-    max_contour_indices = [0] * AREAS # will get as large as AREAS is
-    second_max_contour_index = 0;
-    for contour in contours:
-        # Finds the number of AREAS that have the largest perimeters (most points)
-        if (len(contour) > len(contours[max_contour_indices[0]])): # the smallest in list of maximums
-            max_contour_indices.pop(0)
-            max_contour_indices.append(i)
-            max_contour_indices.sort()
-        i+=1
-    
-    max_contour_index = max_contour_indices[-1]
+    # Rank contours by actual pixel area (cv2.contourArea) rather than point count.
+    # Point count was a poor proxy — a jagged small region can have more points than a
+    # large smooth one. Sorting by area gives the true AREAS largest regions.
+    contour_areas = [(cv2.contourArea(c), idx) for idx, c in enumerate(contours)]
+    contour_areas.sort(key=lambda x: x[0], reverse=True)
+    max_contour_indices = [idx for _, idx in contour_areas[:AREAS]]
+
+    max_contour_index = max_contour_indices[0]
     
     #TODO: Assert Areas is at least 1 so this is not empty
     # Display the contour image
