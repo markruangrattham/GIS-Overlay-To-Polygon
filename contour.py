@@ -316,14 +316,21 @@ def main():
     #cv2.drawContours(contour_image, [contour], -1, (0, 255, 0), 2)  # You can adjust the color and thickness here
     
     
+    if not contours:
+        print(
+            "No contours found. The color mask matched zero pixels.\n"
+            "  - Check that RGBCOLOR matches a color actually present in the image.\n"
+            "  - Try increasing THETA (currently {}) to widen the hue range.".format(THETA),
+            file=sys.stderr,
+        )
+        quit()
+
     # Rank contours by actual pixel area (cv2.contourArea) rather than point count.
     # Point count was a poor proxy — a jagged small region can have more points than a
     # large smooth one. Sorting by area gives the true AREAS largest regions.
     contour_areas = [(cv2.contourArea(c), idx) for idx, c in enumerate(contours)]
     contour_areas.sort(key=lambda x: x[0], reverse=True)
     max_contour_indices = [idx for _, idx in contour_areas[:AREAS]]
-
-    max_contour_index = max_contour_indices[0]
     
     #TODO: Assert Areas is at least 1 so this is not empty
     # Display the contour image
